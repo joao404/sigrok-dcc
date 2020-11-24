@@ -38,6 +38,7 @@ class Decoder(srd.Decoder):
         {'id': 'data', 'name': 'Data', 'desc': 'Data line'},
     )
     options = (
+        {'id': 'min_preamble_length', 'desc': 'MinPreamblelength', 'default': '10'},
         {'id': 'jitter', 'desc': 'Jitter[us]', 'default': '10'},
         {'id': 'one_min', 'desc': 'Logic One Min[us]', 'default': '100'},
         {'id': 'one_max', 'desc': 'Logic One Max[us]', 'default': '130'},
@@ -163,9 +164,9 @@ class Decoder(srd.Decoder):
             self.preamble_count += 1
             return
         elif bit == 0:
-            if self.preamble_count > 15:
+            if self.preamble_count >= self.min_preamble_length:
                 #preamble finished
-                self.put(self.preamble_start, self.preamble_end, self.out_ann, [2, ['PREAMBLE ' + str(self.preamble_count), 'PRE', 'P']])
+                self.put(self.preamble_start, self.samplenum, self.out_ann, [2, ['PREAMBLE ' + str(self.preamble_count), 'PRE', 'P']])
                 self.preamble_count = 0
                 self.data_bit_count = 1
                 self.data_start = self.samplenum
@@ -185,6 +186,9 @@ class Decoder(srd.Decoder):
             if bit == 0:
                 #init bit of byte
                 self.data_bit_count += 1
+            elif bit == 1 and len(self.data) > 2:
+                #when bit after a byte is 2 and we have more than one byte it is the normal end of a telegram
+                self.handle_telegram()
             else:
                 self.state = 'FIND_PREAMBLE'
                 return
@@ -196,7 +200,7 @@ class Decoder(srd.Decoder):
             self.data_bit_count = 0
             self.data.append(self.databyte)
             self.databyte = 0   
-            self.handle_telegram()
+            
         
         
     def handle_telegram(self):        
@@ -204,103 +208,96 @@ class Decoder(srd.Decoder):
 
         #recieved two bytes    
         datalen = len(self.data)
-        if datalen == 2:
-            if self.data[0] == 0xFF and self.data[1] == 0:
+        checksum = 0
+        for x in range(datalen-1):
+            checksum = checksum ^ self.data[x]
+
+        if checksum != self.data[datalen-1]:
+            self.put(self.data_start, self.samplenum, self.out_ann, [2, ['WRONG CHECKSUM:' + str(checksum)+' !=', str(self.data[datalen-1]), 'WRONG CHECK' ]])
+            self.state = 'FIND_PREAMBLE'
+            return
+
+        
+        if datalen == 3:
+            if self.data[0] == 0xFF and self.data[1] == 0 and self.data[2] == 0xFF:
                 self.state = 'FIND_PREAMBLE'
                 self.put(self.data_start, self.samplenum, self.out_ann, [2, ['IDLE', 'I']])
                 return
-
-        elif datalen == 3: 
-            if (self.data[0] ^ self.data[1]) == self.data[2]:
-                #data is correct
-                if (self.data[0] & 0x80 == 0x00):
-                    #short address => else needs 4 bytes
-                    adr = self.data[0] & 0x7F
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['LOCO', 'L']])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
-                    self.handle_single_command_byte(self.data[1])
-                elif (self.data[0] & 0xC0 == 0x80) and (self.data[1] & 0x80 == 0x80):
-                    #function decoder
-                    adr = ((self.data[0] & 0x3F) | (~(self.data[1] | 0x8F)) << 1) & 0xFF
-                    br = (self.data[1] & 0x06)>>1
-                    ind = self.data[1] & 0x01
-                    if ((self.data[1] & 0x08)>>3) == 1:
-                        act = 'on'
-                    else:
-                        act = 'off'
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['FUNC', 'F']])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [4, ['Mod:' + str(br) + ',Inductor:' + str(ind) + '/' + act, str(br) + '/' + str(ind) + '/' + act]])
-                else:
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['UNKNOWN', 'U']])
-                #telegram for accessories
-            elif self.data[2] == 0xFF:                        
-                #byte3 was wrong and we have a preamble already
-                self.preamble_count = 8
+            elif self.data[0] == 0 and self.data[1] == 0 and self.data[2] == 0:
                 self.state = 'FIND_PREAMBLE'
-               
-            
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['Reset', 'R']])
+                return
+            elif (self.data[0] & 0x80 == 0x00):
+                #short address => else needs 4 bytes
+                adr = self.data[0] & 0x7F
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['LOCO', 'L']])
+                self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
+                self.handle_single_command_byte(self.data[1])
+            elif (self.data[0] & 0xC0 == 0x80) and (self.data[1] & 0x80 == 0x80):
+                #function decoder
+                adr = ((self.data[0] & 0x3F) | (~(self.data[1] | 0x8F)) << 1) & 0xFF
+                br = (self.data[1] & 0x06)>>1
+                ind = self.data[1] & 0x01
+                if ((self.data[1] & 0x08)>>3) == 1:
+                    act = 'on'
+                else:
+                    act = 'off'
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['FUNC', 'F']])
+                self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
+                self.put(self.data_start, self.samplenum, self.out_ann, [4, ['Mod:' + str(br) + ',Inductor:' + str(ind) + '/' + act, str(br) + '/' + str(ind) + '/' + act]])
+            else:
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['UNKNOWN3', 'U']])
+           
         elif datalen == 4:
-            if (self.data[0] ^ self.data[1] ^ self.data[2]) == self.data[3]:
-                #data is correct 
-                if (self.data[0] & 0xC0 == 0xC0):
-                    adr = ((self.data[0] & 0x3F) << 8) + self.data[1]
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['LOCO', 'L']])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
-                    self.handle_single_command_byte(self.data[2])
-                elif (self.data[1] & 0xD0) == 0xC0 or (self.data[1] & 0xD0) == 0x20:
-                    #short address and long function or speed command
-                    adr = self.data[0] & 0x3F
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['LOCO', 'L']])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
-                    self.handle_two_command_byte(self.data[1], self.data[2])
-                elif (self.data[0] & 0xC0 == 0x80) and (self.data[1] & 0x89 == 0x01):
-                    #improved function command
-                    adr = ((self.data[0] & 0x3F) | (~(self.data[1] | 0x8F)) << 1) & 0xFF
-                    br = (self.data[1] & 0x06)>>1
-                    func = self.data[2]
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['FUNC', 'F']])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [4, ['Mod:' + str(br) + ',Func:' + str(func), str(br) + '/' + str(func)]])
-                elif (self.data[0] & 0xE0 == 0x20):
-                    #analog output command
-                    #potential bug is analog command which is equal to short loco address higher than 32 and Function 0x3F
-                    command = self.data[0] & 0x1F
-                    cmd_type = self.data[1]
-                    cmd_value = self.data[2]
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['FUNC', 'F']])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(command)]])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [4, ['Type:' + str(cmd_type) + ',Value:' + str(cmd_value), str(cmd_type) + '/' + str(cmd_value)]])
-                else:
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['UNKNOWN', 'U']])
-            elif self.data[3] == 0xFF:
-                #byte4 was wrong and we have a preamble already
-                self.preamble_count = 8
-                self.state = 'FIND_PREAMBLE'
+            if (self.data[0] & 0xC0 == 0xC0):
+                adr = ((self.data[0] & 0x3F) << 8) + self.data[1]
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['LOCO', 'L']])
+                self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
+                self.handle_single_command_byte(self.data[2])
+            elif (self.data[0] & 0xC0) == 0x00:
+                #short address and long function or speed command
+                adr = self.data[0] & 0x3F
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['LOCO', 'L']])
+                self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
+                self.handle_two_command_byte(self.data[1], self.data[2])
+            elif (self.data[0] & 0xC0 == 0x80) and (self.data[1] & 0x89 == 0x01):
+                #improved function command
+                adr = ((self.data[0] & 0x3F) | (~(self.data[1] | 0x8F)) << 1) & 0xFF
+                br = (self.data[1] & 0x06)>>1
+                func = self.data[2]
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['FUNC', 'F']])
+                self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
+                self.put(self.data_start, self.samplenum, self.out_ann, [4, ['Mod:' + str(br) + ',Func:' + str(func), str(br) + '/' + str(func)]])
+            elif (self.data[0] & 0xE0 == 0x20):
+                #analog output command
+                #potential bug is analog command which is equal to short loco address higher than 32 and Function 0x3F
+                command = self.data[0] & 0x1F
+                cmd_type = self.data[1]
+                cmd_value = self.data[2]
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['FUNC', 'F']])
+                self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(command)]])
+                self.put(self.data_start, self.samplenum, self.out_ann, [4, ['Type:' + str(cmd_type) + ',Value:' + str(cmd_value), str(cmd_type) + '/' + str(cmd_value)]])
+            else:
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['UNKNOWN4', 'U']])
                     
         elif datalen == 5:
-            if (self.data[0] ^ self.data[1] ^ self.data[2] ^ self.data[3]) == self.data[4]:
-                #data is correct
-                if (self.data[0] & 0xC0 == 0xC0):
-                    adr = self.data[0] & 0x3F
-                    adr = (adr << 8) + self.data[1]
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['LOCO', 'L']])
-                    self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
-                    self.handle_two_command_byte(self.data[2], self.data[3])
-                else:
-                    self.put(self.data_start, self.samplenum, self.out_ann, [2, ['UNKNOWN', 'U']])
-            elif self.data[4] == 0xFF:
-                #byte4 was wrong and we have a preamble already
-                self.preamble_count = 8
-                self.state = 'FIND_PREAMBLE'
+            if (self.data[0] & 0xC0 == 0xC0):
+                adr = self.data[0] & 0x3F
+                adr = (adr << 8) + self.data[1]
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['LOCO', 'L']])
+                self.put(self.data_start, self.samplenum, self.out_ann, [3, [str(adr)]])
+                self.handle_two_command_byte(self.data[2], self.data[3])
             else:
-                #byte5 was wrong
-                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['WRONG CHECKSUM:' + str(self.data[0] ^ self.data[1] ^ self.data[2] ^ self.data[3])+' !=', str(self.data[4]), 'WRONG CHECK' ]])
-                self.state = 'FIND_PREAMBLE'
+                self.put(self.data_start, self.samplenum, self.out_ann, [2, ['UNKNOWN5', 'U']])
         elif datalen > 5:
             self.put(self.data_start, self.samplenum, self.out_ann, [2, ['UNDEFINED SIZE']])
             self.state = 'FIND_PREAMBLE'
+
+        self.state = 'FIND_PREAMBLE'
         
+    #def handle_extended_command(self):
+    #    if
+    
     def handle_single_command_byte(self, databyte):
         if (databyte & 0xC0) == 0x40:
             #28 speed steps
@@ -413,11 +410,21 @@ class Decoder(srd.Decoder):
         self.data = [0]
         self.preamble_start = self.samplenum
         opt = self.options
+        self.min_preamble_length = int(opt['min_preamble_length'])
         self.jitter_edge_samplenum = int(float(opt['jitter'])*1e-6 * self.samplerate)
         self.bit_one_min_samplenum = int(float(opt['one_min'])*1e-6 * self.samplerate)
         self.bit_one_max_samplenum = int(float(opt['one_max'])*1e-6 * self.samplerate)
         self.bit_zero_min_samplenum = int(float(opt['zero_min'])*1e-6 * self.samplerate)
         self.bit_zero_max_samplenum = int(float(opt['zero_max'])*1e-6 * self.samplerate)
+
+        if self.bit_one_min_samplenum >= self.bit_one_max_samplenum:
+            raise SamplerateError('One bit length minimum higher than maximum.')
+        if self.bit_zero_min_samplenum >= self.bit_zero_max_samplenum:
+            raise SamplerateError('Zero bit length minimum higher than maximum.')
+        if self.jitter_edge_samplenum <= 0:
+            raise SamplerateError('Jitter is not higher than zero.')
+
+
         self.wait({0: 'e'})
         self.bit_end_samplenum = self.samplenum
 
